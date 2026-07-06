@@ -15,9 +15,9 @@ mkdir -p "$KRITA_SUPPORT/pykrita"
 mkdir -p "$SHORTCUTS_DEST"
 
 mkdir -p "$ROOT/participant_data"
+mkdir -p "$ROOT/layout_states"
 
-# Clear cached native layout-state blobs so they regenerate for this plugin version.
-rm -rf "$ROOT/layout_states"
+# Keep shipped layout blobs; only drop stale version files if we bump STATE_VERSION later.
 rsync -a --delete --exclude '__pycache__' "$ROOT/plugin/hide_ui/" "$PLUGIN_DEST/"
 echo "$ROOT/participant_data" > "$PLUGIN_DEST/data_root.txt"
 cp "$ROOT/plugin/hide_ui.desktop" "$KRITA_SUPPORT/pykrita/"

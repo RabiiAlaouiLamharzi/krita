@@ -18,8 +18,10 @@ experiment/plugin/hide_ui/bin/
 experiment/participant_data/
 ~/krita_experiment_data/
 
-# Layout state cache
+# Layout state cache — ship pre-baked blobs; ignore other runtime captures
 *.state
+!experiment/layout_states/
+!experiment/layout_states/*.state
 
 # Editor
 .cursor/
