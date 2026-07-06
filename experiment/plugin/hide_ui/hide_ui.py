@@ -559,7 +559,7 @@ class HideUIExtension(Extension):
         for name in (
                 "_apply_timer", "_tutorial_timer", "_recall_timer",
                 "_recall_phase_timer", "_timer_blink_timer", "_suppress_timer",
-                "_capture_timer", "_panel_guard_timer"):
+                "_capture_timer"):
             timer = getattr(self, name, None)
             if timer is not None:
                 try:
@@ -1539,7 +1539,6 @@ class HideUIExtension(Extension):
             self._update_content_zone(qwin)
         self._update_video_panel(qwin)
         if not self._is_welcome_visible(qwin):
-            self._schedule_study_panels_guard(qwin)
             QTimer.singleShot(250, lambda: self._focus_canvas(qwin))
 
     def _screen_geometry(self):
@@ -1742,7 +1741,6 @@ class HideUIExtension(Extension):
             if self._qwin_alive():
                 self._lock_window(qwin, show=True)
                 self._enforce_window_geometry()
-            self._schedule_study_panels_guard(qwin)
             QTimer.singleShot(100, lambda: self._focus_canvas(qwin))
             _log("polished reveal complete")
             if on_ready:
@@ -2401,9 +2399,6 @@ class HideUIExtension(Extension):
             self._presets_in_toolbar = False
             self._preset_toolbar_action = None
             _log("preset popup rescued from toolbar teardown")
-            if self._qwin_alive():
-                QTimer.singleShot(
-                    0, lambda: self._schedule_study_panels_guard(self._qwin))
         except Exception:
             _log(traceback.format_exc())
 
@@ -3000,7 +2995,6 @@ class HideUIExtension(Extension):
         self._lock_dock_panel_heights(qwin)
         self._apply_all_dock_titles(qwin)
         self._order_study_toolbar(qwin)
-        self._ensure_presets_for_profile(qwin, profile)
 
     def _expected_dock_areas(self, profile):
         """Dock area each of the four study dockers must occupy per profile.
@@ -3365,8 +3359,6 @@ class HideUIExtension(Extension):
                 self._study_toolbar.show()
             if self._recall_active:
                 self._order_study_toolbar(self._qwin)
-            elif self._is_canvas_ready(self._qwin):
-                self._ensure_study_panels_present(self._qwin)
             if not self._quitting:
                 if self._break_active or self._recall_active:
                     self._update_video_panel(self._qwin)
@@ -4145,8 +4137,6 @@ class HideUIExtension(Extension):
             self._study_layout_profile = "A"
             self._study_layout_applied_sig = None
             self._lock_dock_panels_layout_a(qwin)
-            self._ensure_presets_for_profile(qwin, "A")
-            self._schedule_study_panels_guard(qwin)
             QApplication.processEvents()
             return
         self._study_layout_profile = profile
@@ -4155,7 +4145,6 @@ class HideUIExtension(Extension):
             self._learning_layout_profile = profile
         self._apply_study_layout(qwin)
         self._ensure_presets_for_profile(qwin, profile)
-        self._schedule_study_panels_guard(qwin)
         QApplication.processEvents()
 
     def _prepare_study_canvas(self, qwin, on_ready, label="phase", layout_after=None):
@@ -4196,7 +4185,6 @@ class HideUIExtension(Extension):
                         fail()
                         return
                     self._restore_layout_after_document_churn(qwin, restore)
-                    self._schedule_study_panels_guard(qwin)
                     succeed()
                 except Exception:
                     _log(traceback.format_exc())
@@ -4483,7 +4471,7 @@ class HideUIExtension(Extension):
                                     qwin, toolbox)
                         _step(lambda: self._update_text_tool_ui(qwin), "text_tool_ui")
                         _step(lambda: self._update_video_panel(qwin), "video_panel")
-                        self._schedule_study_panels_guard(qwin)
+                        _step(lambda: self._present_krita(qwin), "present_krita_2")
                         QTimer.singleShot(200, lambda: self._focus_canvas(qwin))
                         _log("finish_ready: Krita canvas shown")
                         if on_ready:
@@ -4570,7 +4558,6 @@ class HideUIExtension(Extension):
             self._ensure_study_chrome(qwin)
             self._show_study_toolbars(qwin)
             self._schedule_study_toolbar_order(qwin)
-            self._schedule_study_panels_guard(qwin)
             self._ensure_study_dockers_visible(qwin)
             if self._recall_mask_state:
                 self._unmask_recall_commands(qwin)
@@ -4618,134 +4605,21 @@ class HideUIExtension(Extension):
                 except Exception:
                     pass
 
-    def _active_study_profile(self):
-        return getattr(self, "_study_layout_profile", "A") or "A"
-
-    def _audit_study_panels(self, qwin):
-        """Report problems if any of the four study panels are missing or empty."""
-        problems = []
-        if not _qt_alive(qwin) or self._quitting or self._break_active:
-            return problems
-        if self._is_welcome_visible(qwin):
-            return problems
-        from .layout_profiles import profile_flags
-        flags = profile_flags(self._active_study_profile())
-        for name in KEEP_DOCKERS:
-            dock = self._dock_by_name(qwin, name)
-            if dock is None:
-                problems.append("%s missing from window" % name)
-                continue
-            if name == "PresetDocker":
-                if flags["presets_in_toolbar"]:
-                    if not self._presets_in_toolbar:
-                        problems.append("brush presets not in toolbar")
-                    else:
-                        popup = self._preset_popup_widget
-                        if popup is None or not _qt_alive(popup):
-                            popup = self._find_preset_popup_widget(qwin)
-                        if popup is None or not self._preset_widget_has_chooser(popup):
-                            problems.append("brush preset widget missing")
-                        elif not popup.isVisible():
-                            problems.append("brush preset widget hidden")
-                else:
-                    if not dock.isVisible():
-                        problems.append("PresetDocker hidden")
-                    else:
-                        popup = self._find_preset_popup_widget(qwin)
-                        if popup is None or not self._preset_widget_has_chooser(popup):
-                            problems.append("PresetDocker empty")
-            elif not dock.isVisible():
-                problems.append("%s hidden" % name)
-        return problems
-
-    def _repair_study_panels(self, qwin, escalate=False):
-        """Restore all four study panels — never leave brushes/tools/colors/layers gone."""
-        if not _qt_alive(qwin) or self._quitting or self._break_active:
+    def _ensure_study_dockers_visible(self, qwin):
+        """Keep size slider and color selector visible during the study."""
+        if not _qt_alive(qwin):
             return
-        profile = self._active_study_profile()
-        from .layout_profiles import profile_flags
-        flags = profile_flags(profile)
-        if escalate:
-            _log("PANEL GUARD: escalating layout repair for profile %s" % profile)
-            if profile == "A" or self._is_session1():
-                self._lock_dock_panels_layout_a(qwin)
-            else:
-                self._study_layout_applied_sig = None
-                self._apply_study_layout(qwin)
-        self._ensure_presets_for_profile(qwin, profile)
-        for name in ("ToolBox", "ColorSelectorNg", "KisLayerBox"):
-            dock = self._dock_by_name(qwin, name)
-            if dock is not None:
-                dock.setProperty("hideui_recall_hidden", None)
-                dock.show()
-        tb = self._find_brushes_toolbar(qwin)
-        if tb is not None:
-            tb.setProperty("hideui_recall_hidden", None)
-            tb.show()
-        if flags["presets_in_toolbar"]:
-            if not self._presets_in_toolbar:
-                self._embed_presets_in_toolbar(qwin)
-            popup = self._preset_popup_widget or self._find_preset_popup_widget(qwin)
-            if popup is not None and _qt_alive(popup):
-                popup.show()
-            dock = self._dock_by_name(qwin, "PresetDocker")
-            if dock is not None:
-                dock.hide()
-        else:
-            self._unembed_presets_from_toolbar(qwin)
-            dock = self._dock_by_name(qwin, "PresetDocker")
-            popup = self._find_preset_popup_widget(qwin)
-            if dock is not None:
-                dock.show()
-                if popup is not None and _qt_alive(popup):
-                    if dock.widget() is not popup:
-                        popup.setParent(dock)
-                        dock.setWidget(popup)
-                    popup.show()
-                self._fix_preset_gap(qwin)
-
-    def _ensure_study_panels_present(self, qwin):
-        """Verify + repair the four study panels whenever the UI loads or transitions."""
-        if not _qt_alive(qwin) or self._quitting or self._break_active:
-            return True
-        if self._is_welcome_visible(qwin):
-            return True
         try:
-            problems = self._audit_study_panels(qwin)
-            if problems:
-                _log("PANEL GUARD: %s" % "; ".join(problems))
-                attempt = getattr(self, "_panel_guard_repairs", 0) + 1
-                self._panel_guard_repairs = attempt
-                self._repair_study_panels(qwin, escalate=(attempt >= 3))
-                problems = self._audit_study_panels(qwin)
-                if problems:
-                    _log("PANEL GUARD still failing: %s" % "; ".join(problems))
-                    return False
-            else:
-                self._panel_guard_repairs = 0
-            return True
+            for tb in qwin.findChildren(QToolBar):
+                if tb.objectName() == "BrushesAndStuff":
+                    tb.setProperty("hideui_recall_hidden", None)
+                    tb.show()
+            for dock in qwin.findChildren(QDockWidget):
+                if dock.objectName() == "ColorSelectorNg":
+                    dock.setProperty("hideui_recall_hidden", None)
+                    dock.show()
         except Exception:
             _log(traceback.format_exc())
-            return False
-
-    def _schedule_study_panels_guard(self, qwin):
-        """Re-check study panels after async layout / document work."""
-        if self._quitting or not _qt_alive(qwin):
-            return
-        self._ensure_study_panels_present(qwin)
-        timer = getattr(self, "_panel_guard_timer", None)
-        if timer is not None:
-            try:
-                timer.stop()
-            except Exception:
-                pass
-        for delay in (0, 100, 400, 1200, 2500):
-            QTimer.singleShot(
-                delay, lambda q=qwin: self._ensure_study_panels_present(q))
-
-    def _ensure_study_dockers_visible(self, qwin):
-        """Keep all four study panels present during the study."""
-        self._ensure_study_panels_present(qwin)
 
     def _refresh_preset_docker_recall(self, qwin):
         """Keep only the two study brushes visible; overlays hide them."""
@@ -6201,22 +6075,6 @@ class HideUIExtension(Extension):
                 and obj.metaObject().className() == "KisWelcomePageWidget"):
             QTimer.singleShot(0, lambda: self._force_canvas_if_needed(self._qwin))
             return True
-
-        # If a study panel is hidden unexpectedly, restore it immediately.
-        if (event.type() == QEvent.Hide
-                and isinstance(obj, QDockWidget)
-                and self.session and not self._quitting
-                and not self._break_active
-                and obj.objectName() in KEEP_DOCKERS):
-            from .layout_profiles import profile_flags
-            name = obj.objectName()
-            flags = profile_flags(self._active_study_profile())
-            if name == "PresetDocker" and flags["presets_in_toolbar"]:
-                pass
-            elif not obj.property("hideui_recall_hidden"):
-                if self._qwin_alive():
-                    QTimer.singleShot(
-                        0, lambda: self._schedule_study_panels_guard(self._qwin))
 
         # Block any attempt to show a non-kept docker.
         if event.type() == QEvent.Show:
