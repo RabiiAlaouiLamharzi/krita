@@ -2302,21 +2302,9 @@ class HideUIExtension(Extension):
 
     def _embed_presets_in_toolbar(self, qwin):
         if self._presets_in_toolbar:
-            # Trust the flag only if our action is really still in the toolbar
-            # AND the popup is alive; a stale flag here used to leave the
-            # docker showing an empty placeholder ("title but no content").
-            tb_check = self._find_brushes_toolbar(qwin)
-            action = self._preset_toolbar_action
-            popup = self._preset_popup_widget
-            if (tb_check is not None and action is not None
-                    and popup is not None and _qt_alive(popup)
-                    and action in tb_check.actions()):
-                self._configure_preset_horizontal(popup)
-                self._schedule_preset_arrow_suppression(popup)
-                return
-            _log("embed presets: stale toolbar flag detected, re-embedding")
-            self._presets_in_toolbar = False
-            self._preset_toolbar_action = None
+            self._configure_preset_horizontal(self._preset_popup_widget)
+            self._schedule_preset_arrow_suppression(self._preset_popup_widget)
+            return
         tb = self._find_brushes_toolbar(qwin)
         dock = self._dock_by_name(qwin, "PresetDocker")
         if tb is None or dock is None:
@@ -2364,10 +2352,6 @@ class HideUIExtension(Extension):
             tb.setProperty("hideui_preset_rescue", True)
             tb.destroyed.connect(
                 lambda *a: self._rescue_preset_popup_from_teardown())
-        # Same rescue on the host itself: covers deletion paths that never
-        # destroy the whole toolbar (e.g. the action alone being deleted).
-        host.destroyed.connect(
-            lambda *a: self._rescue_preset_popup_from_teardown())
         dock.hide()
         self._preset_toolbar_action = action
         self._preset_popup_widget = popup
@@ -2386,11 +2370,6 @@ class HideUIExtension(Extension):
             if tb is not None and action is not None:
                 tb.removeAction(action)
         popup = self._preset_popup_widget
-        if popup is None or not _qt_alive(popup):
-            # Cached pointer can be stale after a soft detach or rescue;
-            # search for the live widget so the docker never keeps only
-            # the empty placeholder.
-            popup = self._find_preset_popup_widget(qwin)
         dock = self._dock_by_name(qwin, "PresetDocker")
         restored = False
         if popup is not None and _qt_alive(popup) and dock is not None:
@@ -2416,11 +2395,6 @@ class HideUIExtension(Extension):
             if popup is None or not _qt_alive(popup):
                 return
             if not self._qwin_alive():
-                return
-            # Already safe inside its docker (Layout A): a leftover toolbar
-            # host dying later must not pull the widget back out.
-            dock = self._dock_by_name(self._qwin, "PresetDocker")
-            if dock is not None and dock.widget() is popup:
                 return
             popup.hide()
             popup.setParent(self._qwin)
