@@ -18,10 +18,6 @@ from PyQt5.QtWidgets import (
 
 MAC_CLOSE_SIZE = 16
 STUDY_TOP_BAR_H = 36
-CHURN_STEP_MS = 60          # in-place document reset path
-CHURN_STEP_MS_SLOW = 120    # close/create document path
-CHURN_NEUTRALIZE_MS = 150   # pause before createDocument
-CANVAS_WAIT_MS = 40         # poll interval while waiting for canvas
 STUDY_CHROME_TOOLBAR = "hideuiStudyBar"
 NATIVE_TOOLBARS = ("editToolBar", "BrushesAndStuff")
 STUDY_TOOLBARS = (STUDY_CHROME_TOOLBAR,) + NATIVE_TOOLBARS
@@ -539,7 +535,6 @@ class HideUIExtension(Extension):
         self._capture_attempts = 0
         self._dock_refs = {}
         self._dock_ref_warned = set()
-        self._brushes_toolbar_ref = None
         self._presets_in_toolbar = False
         self._preset_toolbar_action = None
         self._preset_popup_widget = None
@@ -1394,7 +1389,6 @@ class HideUIExtension(Extension):
         self._learning_tracker = None
         self._learning_steps = None
         self._recall_layout_profile_override = None
-        self._invalidate_dock_cache()
 
     def _run_gateway(self, qwin):
         if self._gateway_done:
@@ -1903,7 +1897,7 @@ class HideUIExtension(Extension):
     def _schedule_study_toolbar_order(self, qwin):
         """Re-apply toolbar row order after async layout restores (recall)."""
         self._order_study_toolbar(qwin)
-        for delay in (80, 400):
+        for delay in (80, 250, 600, 1500):
             QTimer.singleShot(
                 delay, lambda q=qwin: self._order_study_toolbar(q))
 
@@ -2049,36 +2043,6 @@ class HideUIExtension(Extension):
         else:
             self._apply_study_layout(self._qwin)
 
-    def _invalidate_dock_cache(self):
-        self._dock_refs = {}
-        self._dock_ref_warned = set()
-        self._brushes_toolbar_ref = None
-
-    def _run_ui_polish_pass(self, qwin):
-        """One deferred pass for trim/slider/hook work after layout settles."""
-        if self._quitting or not _qt_alive(qwin):
-            return
-        try:
-            self._trim_brush_presets(qwin)
-            self._trim_panel_commands(qwin)
-            self._configure_native_brush_slider(qwin)
-            self._hook_toolbox_tool_tracking(qwin)
-            self._hook_study_brush_size_sync(qwin)
-            self._configure_layers_panel(qwin)
-            self._disable_krita_shortcuts(qwin)
-            self._update_text_tool_ui(qwin)
-            self._ensure_default_brush()
-            self._order_study_toolbar(qwin)
-            self._hide_document_chrome(qwin)
-        except Exception:
-            _log(traceback.format_exc())
-
-    def _schedule_ui_polish(self, qwin):
-        self._run_ui_polish_pass(qwin)
-        for delay in (400, 1200):
-            QTimer.singleShot(
-                delay, lambda q=qwin: self._run_ui_polish_pass(q))
-
     def _dock_by_name(self, qwin, name):
         dock = qwin.findChild(QDockWidget, name)
         if dock is not None:
@@ -2096,11 +2060,8 @@ class HideUIExtension(Extension):
         return None
 
     def _find_brushes_toolbar(self, qwin):
-        if self._brushes_toolbar_ref is not None and _qt_alive(self._brushes_toolbar_ref):
-            return self._brushes_toolbar_ref
         for tb in qwin.findChildren(QToolBar):
             if tb.objectName() == "BrushesAndStuff":
-                self._brushes_toolbar_ref = tb
                 return tb
         return None
 
@@ -3231,7 +3192,6 @@ class HideUIExtension(Extension):
                 self._ensure_presets_for_profile(qwin, profile)
                 return
 
-            self._invalidate_dock_cache()
             docks = {
                 name: self._dock_by_name(qwin, name) for name in KEEP_DOCKERS}
             for dock in docks.values():
@@ -4237,14 +4197,14 @@ class HideUIExtension(Extension):
                     fail()
                     return
                 if self._switch_to_canvas(qwin):
-                    QTimer.singleShot(CHURN_STEP_MS, step_restore)
+                    QTimer.singleShot(120, step_restore)
                     return
                 attempts[0] += 1
                 if attempts[0] > 60:
                     _log("prepare_study_canvas: timeout (%s)" % label)
                     fail()
                 else:
-                    QTimer.singleShot(CANVAS_WAIT_MS, lambda: step_wait_canvas(attempts))
+                    QTimer.singleShot(50, lambda: step_wait_canvas(attempts))
 
             def step_close_old(old_docs):
                 try:
@@ -4263,7 +4223,7 @@ class HideUIExtension(Extension):
                     self._canvas_w = None
                     self._session1_doc_ready = False
                     _log("closed old documents (%s)" % label)
-                    QTimer.singleShot(CHURN_STEP_MS_SLOW, step_wait_canvas)
+                    QTimer.singleShot(120, step_wait_canvas)
                 except Exception:
                     _log(traceback.format_exc())
                     fail()
@@ -4278,7 +4238,7 @@ class HideUIExtension(Extension):
                     self._new_default(force=True)
                     QApplication.processEvents()
                     _log("new document created (%s)" % label)
-                    QTimer.singleShot(CHURN_STEP_MS_SLOW, lambda: step_close_old(old_docs))
+                    QTimer.singleShot(120, lambda: step_close_old(old_docs))
                 except Exception:
                     _log(traceback.format_exc())
                     fail()
@@ -4290,7 +4250,7 @@ class HideUIExtension(Extension):
                         return
                     if self._reset_active_document_blank(qwin):
                         _log("document reset in place (%s)" % label)
-                        QTimer.singleShot(CHURN_STEP_MS, step_restore)
+                        QTimer.singleShot(120, step_restore)
                     else:
                         _log("document reset failed, using createDocument (%s)" % label)
                         step_neutralize_then_create()
@@ -4304,7 +4264,7 @@ class HideUIExtension(Extension):
                         fail()
                         return
                     self._neutralize_for_document_churn(qwin)
-                    QTimer.singleShot(CHURN_NEUTRALIZE_MS, step_create)
+                    QTimer.singleShot(300, step_create)
                 except Exception:
                     _log(traceback.format_exc())
                     fail()
@@ -4321,12 +4281,12 @@ class HideUIExtension(Extension):
                         _log(
                             "prepare_study_canvas: reset path (%s -> %s)"
                             % (label, restore))
-                        QTimer.singleShot(CHURN_STEP_MS, step_reset_in_place)
+                        QTimer.singleShot(120, step_reset_in_place)
                     else:
                         _log(
                             "prepare_study_canvas: create path (%s -> %s)"
                             % (label, restore))
-                        QTimer.singleShot(CHURN_STEP_MS_SLOW, step_neutralize_then_create)
+                        QTimer.singleShot(120, step_neutralize_then_create)
                 except Exception:
                     _log(traceback.format_exc())
                     fail()
@@ -4370,25 +4330,6 @@ class HideUIExtension(Extension):
         """New blank image for every recall phase."""
         layout_after = self._recall_layout_profile()
         _log("prepare_recall_canvas: layout=%s" % layout_after)
-        current = getattr(self, "_study_layout_profile", "A")
-        if (layout_after == current
-                and self._is_canvas_ready(qwin)
-                and self._can_reset_document_for_churn("recall", layout_after)):
-            _log("prepare_recall_canvas: fast path (reuse canvas)")
-            self._phase_transition_busy = True
-            self._arm_loading_screen("Preparing canvas…", 2)
-            try:
-                self._halt_deferred_work()
-                self._sync_kritarc_layout_state(layout_after)
-                if self._reset_active_document_blank(qwin):
-                    self._restore_layout_after_document_churn(qwin, layout_after)
-                    self._phase_transition_busy = False
-                    if on_ready:
-                        on_ready(True)
-                    return
-            except Exception:
-                _log(traceback.format_exc())
-            self._phase_transition_busy = False
         self._prepare_study_canvas(
             qwin, on_ready, label="recall", layout_after=layout_after)
 
@@ -4493,18 +4434,27 @@ class HideUIExtension(Extension):
                         _step(lambda: self._ensure_study_chrome(qwin), "study_chrome")
                         _step(lambda: self._show_study_toolbars(qwin), "toolbars")
                         _step(lambda: self._hide_document_chrome(qwin), "hide_chrome")
-                        QTimer.singleShot(
-                            400, lambda q=qwin: self._hide_document_chrome(q))
+                        for delay in (300, 1000):
+                            QTimer.singleShot(
+                                delay,
+                                lambda q=qwin: self._hide_document_chrome(q))
 
                         def _maybe_lock_docks(q=qwin):
                             if (not self._recall_active
                                     and not self._phase_transition_busy):
                                 self._lock_dock_panels(q)
 
-                        QTimer.singleShot(600, _maybe_lock_docks)
+                        for delay in (400, 1200):
+                            QTimer.singleShot(delay, _maybe_lock_docks)
                         _step(
                             lambda: self._configure_native_brush_slider(qwin),
                             "brush_slider")
+                        for delay in (500, 1500):
+                            QTimer.singleShot(
+                                delay,
+                                lambda q=qwin: (
+                                    self._configure_native_brush_slider(q)))
+                        _step(lambda: self._ensure_study_chrome(qwin), "study_chrome_2")
                         _step(lambda: self._ensure_default_brush(), "default_brush")
                         _step(
                             lambda: self._hook_toolbox_tool_tracking(qwin),
@@ -4521,7 +4471,7 @@ class HideUIExtension(Extension):
                                     qwin, toolbox)
                         _step(lambda: self._update_text_tool_ui(qwin), "text_tool_ui")
                         _step(lambda: self._update_video_panel(qwin), "video_panel")
-                        self._schedule_ui_polish(qwin)
+                        _step(lambda: self._present_krita(qwin), "present_krita_2")
                         QTimer.singleShot(200, lambda: self._focus_canvas(qwin))
                         _log("finish_ready: Krita canvas shown")
                         if on_ready:
@@ -5143,9 +5093,9 @@ class HideUIExtension(Extension):
         self._recall_remaining_sec = per_q
         self._update_recall_timer_display()
         self._set_recall_timer_visible(True)
-        for delay in (0, 400):
+        for delay in (80, 250, 600, 1500):
             self._schedule_recall_overlay_rebuild(qwin, delay)
-        QTimer.singleShot(80, lambda: self._position_recall_question_banner(qwin))
+        QTimer.singleShot(120, lambda: self._position_recall_question_banner(qwin))
         if self._recall_timer is not None:
             self._recall_timer.stop()
 
@@ -6856,12 +6806,31 @@ class HideUIExtension(Extension):
                 self._schedule_study_layout_refresh(qwin)
             else:
                 self._lock_dock_panels_layout_a(qwin)
+            for delay in (400, 1200, 2500):
+                QTimer.singleShot(
+                    delay, lambda q=qwin: self._trim_brush_presets(q))
+            QTimer.singleShot(700, lambda: self._ensure_default_brush())
+            QTimer.singleShot(2600, lambda: self._ensure_default_brush())
+            QTimer.singleShot(600, lambda q=qwin: self._hook_toolbox_tool_tracking(q))
+            QTimer.singleShot(800, lambda q=qwin: self._update_text_tool_ui(q))
+            QTimer.singleShot(600, lambda q=qwin: self._trim_panel_commands(q))
+            for delay in (1200, 2500):
+                QTimer.singleShot(
+                    delay, lambda q=qwin: self._configure_layers_panel(q))
             if qwin.isVisible() or getattr(self, "_polish_reveal_active", False):
                 self._ensure_study_chrome(qwin)
                 self._show_study_toolbars(qwin)
                 self._hide_document_chrome(qwin)
                 self._configure_native_brush_slider(qwin)
-            self._schedule_ui_polish(qwin)
+            for delay in (500, 1500):
+                QTimer.singleShot(
+                    delay, lambda q=qwin: self._configure_native_brush_slider(q))
+            for delay in (600, 1500, 3000):
+                QTimer.singleShot(
+                    delay, lambda q=qwin: self._hook_study_brush_size_sync(q))
+            for delay in (400, 1500, 3000):
+                QTimer.singleShot(
+                    delay, lambda q=qwin: self._disable_krita_shortcuts(q))
             self._update_content_zone(qwin)
             self._suppress_canvas_floating_messages(qwin)
         except Exception:
