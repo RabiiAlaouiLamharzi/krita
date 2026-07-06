@@ -5,15 +5,12 @@ completely hidden until the participant finishes every required step.
 """
 
 import os
-import csv
 import json
-import base64
 import hashlib
 import datetime
 import traceback
 
-from PyQt5.QtCore import Qt, QEventLoop, QTimer, QBuffer
-from PyQt5.QtGui import QImage, QPainter, QPen, QColor
+from PyQt5.QtCore import Qt, QEventLoop, QTimer
 from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QComboBox, QPushButton, QVBoxLayout,
     QHBoxLayout, QFormLayout, QWidget, QTextEdit,
@@ -21,8 +18,26 @@ from PyQt5.QtWidgets import (
 
 from .ui_controls import WhiteDotToggle
 
-BASE_DIR = os.path.expanduser("~/krita_experiment_data")
 PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_base_dir():
+    """Participant CSV logs live under experiment/participant_data/."""
+    pointer = os.path.join(PLUGIN_DIR, "data_root.txt")
+    if os.path.isfile(pointer):
+        with open(pointer) as f:
+            path = f.read().strip()
+            if path:
+                return os.path.abspath(os.path.expanduser(path))
+    repo_data = os.path.abspath(
+        os.path.join(PLUGIN_DIR, "..", "..", "participant_data"))
+    if os.path.isdir(os.path.join(os.path.dirname(repo_data), "plugin")):
+        return repo_data
+    return os.path.abspath(os.path.expanduser(
+        "~/Desktop/untitled folder 24/experiment/participant_data"))
+
+
+BASE_DIR = _resolve_base_dir()
 PASSWORDS_FILE = os.path.join(PLUGIN_DIR, "passwords.json")
 CONSENT_FILE = os.path.join(PLUGIN_DIR, "consent.txt")
 LOG = os.path.expanduser("~/krita_hide_ui_log.txt")
@@ -243,50 +258,93 @@ class GatewayWindow(QWidget):
         return self._result
 
 
-class SignatureCanvas(QWidget):
-    def __init__(self, parent=None, width=520, height=180):
-        super().__init__(parent)
-        self.setFixedSize(width, height)
-        self._img = QImage(width, height, QImage.Format_RGB32)
-        self._img.fill(Qt.white)
-        self._last = None
-        self.has_signed = False
-        self.setCursor(Qt.CrossCursor)
-        self.setStyleSheet("background-color: white; border: 1px solid #888;")
+class ConsentWindow(GatewayWindow):
 
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.drawImage(0, 0, self._img)
+    def __init__(self, consent_text):
+        super().__init__("Consent Form")
 
-    def mousePressEvent(self, event):
-        self._last = event.pos()
-        self.has_signed = True
+        title = QLabel("Consent to Participate")
+        f = title.font()
+        f.setPointSize(18)
+        f.setBold(True)
+        title.setFont(f)
+        title.setAlignment(Qt.AlignCenter)
 
-    def mouseMoveEvent(self, event):
-        if self._last is not None:
-            painter = QPainter(self._img)
-            pen = QPen(QColor(0, 0, 0), 3, Qt.SolidLine, Qt.RoundCap,
-                       Qt.RoundJoin)
-            painter.setPen(pen)
-            painter.drawLine(self._last, event.pos())
-            painter.end()
-            self._last = event.pos()
-            self.update()
+        notice = QLabel(
+            "You must read and agree before you can use the software.")
+        notice.setAlignment(Qt.AlignCenter)
+        notice.setStyleSheet("color:#aaa;")
 
-    def mouseReleaseEvent(self, event):
-        self._last = None
+        rules_label = QLabel("Onboarding rules")
+        rules_label.setStyleSheet("font-weight: bold; color: #ccc;")
 
-    def clear(self):
-        self._img.fill(Qt.white)
-        self.has_signed = False
-        self.update()
+        rules_text = QTextEdit()
+        rules_text.setReadOnly(True)
+        rules_text.setPlainText(consent_text)
+        rules_text.setFrameStyle(QFrame.NoFrame)
 
-    def to_base64_png(self):
-        """Encode signature as base64 text (not saved as an image file)."""
-        buf = QBuffer()
-        buf.open(QBuffer.ReadWrite)
-        self._img.save(buf, "PNG")
-        return base64.b64encode(bytes(buf.data())).decode("ascii")
+        rules_scroll = QScrollArea()
+        rules_scroll.setWidget(rules_text)
+        rules_scroll.setWidgetResizable(True)
+        rules_scroll.setFixedHeight(280)
+        rules_scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #555; background: #3c3c3c; }")
+
+        rules_box = QVBoxLayout()
+        rules_box.setSpacing(6)
+        rules_box.addWidget(rules_label)
+        rules_box.addWidget(rules_scroll)
+
+        rules_widget = QWidget()
+        rules_widget.setLayout(rules_box)
+
+        self.agree = WhiteDotToggle()
+        agree_text = QLabel(
+            "I have read and understood the above and I agree to participate.")
+        agree_text.setWordWrap(True)
+
+        agree_row = QHBoxLayout()
+        agree_row.setContentsMargins(0, 0, 0, 0)
+        agree_row.addWidget(self.agree, alignment=Qt.AlignTop)
+        agree_row.addWidget(agree_text, stretch=1)
+
+        agree_widget = QWidget()
+        agree_lay = QVBoxLayout(agree_widget)
+        agree_lay.setContentsMargins(0, 12, 0, 12)
+        agree_lay.addLayout(agree_row)
+
+        self.msg = QLabel("")
+        self.msg.setStyleSheet("color:#e06c6c;")
+        self.msg.setWordWrap(True)
+        self.msg.setAlignment(Qt.AlignCenter)
+
+        self.submitBtn = QPushButton("Continue")
+        self.submitBtn.setDefault(True)
+        btns = QHBoxLayout()
+        btns.addStretch()
+        btns.addWidget(self.submitBtn)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(32, 28, 32, 28)
+        lay.setSpacing(0)
+        lay.addWidget(title)
+        lay.addWidget(notice)
+        lay.addSpacing(12)
+        lay.addWidget(rules_widget)
+        lay.addWidget(agree_widget)
+        lay.addWidget(self.msg)
+        lay.addSpacing(8)
+        lay.addLayout(btns)
+
+        self.setMinimumSize(700, 520)
+
+        self.submitBtn.clicked.connect(self._submit)
+
+    def _submit(self):
+        if not self.agree.isChecked():
+            self.msg.setText("You must check the agreement box to continue.")
+            return
+        self._finish(True)
 
 
 class LoginWindow(GatewayWindow):
@@ -392,127 +450,6 @@ class LoginWindow(GatewayWindow):
         })
 
 
-class ConsentWindow(GatewayWindow):
-
-    def __init__(self, consent_text):
-        super().__init__("Consent Form")
-        self._signed_ok = False
-
-        title = QLabel("Consent to Participate")
-        f = title.font()
-        f.setPointSize(18)
-        f.setBold(True)
-        title.setFont(f)
-        title.setAlignment(Qt.AlignCenter)
-
-        notice = QLabel(
-            "You must read, agree, and sign before you can use the software.")
-        notice.setAlignment(Qt.AlignCenter)
-        notice.setStyleSheet("color:#aaa;")
-
-        # --- Rules box (scrollable, fixed height) ---
-        rules_label = QLabel("Onboarding rules")
-        rules_label.setStyleSheet("font-weight: bold; color: #ccc;")
-
-        rules_text = QTextEdit()
-        rules_text.setReadOnly(True)
-        rules_text.setPlainText(consent_text)
-        rules_text.setFrameStyle(QFrame.NoFrame)
-
-        rules_scroll = QScrollArea()
-        rules_scroll.setWidget(rules_text)
-        rules_scroll.setWidgetResizable(True)
-        rules_scroll.setFixedHeight(280)
-        rules_scroll.setStyleSheet(
-            "QScrollArea { border: 1px solid #555; background: #3c3c3c; }")
-
-        rules_box = QVBoxLayout()
-        rules_box.setSpacing(6)
-        rules_box.addWidget(rules_label)
-        rules_box.addWidget(rules_scroll)
-
-        rules_widget = QWidget()
-        rules_widget.setLayout(rules_box)
-
-        # --- Agreement checkbox: clearly BELOW the rules box ---
-        self.agree = WhiteDotToggle()
-        agree_text = QLabel(
-            "I have read and understood the above and I agree to participate.")
-        agree_text.setWordWrap(True)
-
-        agree_row = QHBoxLayout()
-        agree_row.setContentsMargins(0, 0, 0, 0)
-        agree_row.addWidget(self.agree, alignment=Qt.AlignTop)
-        agree_row.addWidget(agree_text, stretch=1)
-
-        agree_widget = QWidget()
-        agree_lay = QVBoxLayout(agree_widget)
-        agree_lay.setContentsMargins(0, 12, 0, 12)
-        agree_lay.addLayout(agree_row)
-
-        # --- Signature section ---
-        sig_label = QLabel("Please sign below using your mouse:")
-        sig_label.setStyleSheet("font-weight: bold; color: #ccc;")
-
-        self.canvas = SignatureCanvas(self)
-        sig_row = QHBoxLayout()
-        sig_row.addStretch()
-        sig_row.addWidget(self.canvas)
-        sig_row.addStretch()
-
-        sig_widget = QWidget()
-        sig_lay = QVBoxLayout(sig_widget)
-        sig_lay.setContentsMargins(0, 0, 0, 0)
-        sig_lay.setSpacing(8)
-        sig_lay.addWidget(sig_label)
-        sig_lay.addLayout(sig_row)
-
-        self.msg = QLabel("")
-        self.msg.setStyleSheet("color:#e06c6c;")
-        self.msg.setWordWrap(True)
-        self.msg.setAlignment(Qt.AlignCenter)
-
-        clearBtn = QPushButton("Clear signature")
-        self.submitBtn = QPushButton("Sign & Continue")
-        self.submitBtn.setDefault(True)
-        btns = QHBoxLayout()
-        btns.addWidget(clearBtn)
-        btns.addStretch()
-        btns.addWidget(self.submitBtn)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(32, 28, 32, 28)
-        lay.setSpacing(0)
-        lay.addWidget(title)
-        lay.addWidget(notice)
-        lay.addSpacing(12)
-        lay.addWidget(rules_widget)
-        lay.addWidget(agree_widget)
-        lay.addWidget(sig_widget)
-        lay.addWidget(self.msg)
-        lay.addSpacing(8)
-        lay.addLayout(btns)
-
-        self.setMinimumSize(700, 680)
-
-        clearBtn.clicked.connect(self.canvas.clear)
-        self.submitBtn.clicked.connect(self._submit)
-
-    def _submit(self):
-        if not self.agree.isChecked():
-            self.msg.setText("You must check the agreement box to continue.")
-            return
-        if not self.canvas.has_signed:
-            self.msg.setText("Please provide your signature before continuing.")
-            return
-        self._signed_ok = True
-        self._finish(True)
-
-    @property
-    def signed_ok(self):
-        return self._signed_ok
-
-
 def _hide_krita(qwin):
     suppress_krita_ui()
     if qwin is not None:
@@ -525,22 +462,6 @@ def _show_krita(qwin):
         qwin.show()
         qwin.raise_()
         qwin.activateWindow()
-
-
-def _save_session_record(pdir, info, ts):
-    path = os.path.join(pdir, "sessions.csv")
-    is_new = not os.path.exists(path)
-    try:
-        with open(path, "a", newline="") as f:
-            w = csv.writer(f)
-            if is_new:
-                w.writerow(["timestamp", "participant_id", "session",
-                            "condition", "consent_signed", "consent_record"])
-            w.writerow([ts, info["participant_id"], info["session"],
-                        info["condition"], info.get("consent_signed", ""),
-                        info.get("consent_record", "")])
-    except Exception:
-        _log(traceback.format_exc())
 
 
 def run_gateway(qwin):
@@ -556,8 +477,6 @@ def run_gateway(qwin):
             return None
         _log("login ok: %s" % info)
 
-        pdir = os.path.join(BASE_DIR, info["participant_id"])
-        os.makedirs(pdir, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if info["session"] == 1:
@@ -567,30 +486,11 @@ def run_gateway(qwin):
                 _log("ConsentWindow failed:\n" + traceback.format_exc())
                 return None
             ok = consent_win.run_blocking()
-            if not ok or not consent_win.signed_ok:
+            if not ok:
                 return None
-            record_path = os.path.join(pdir, "consent_%s.json" % ts)
-            record = {
-                "participant_id": info["participant_id"],
-                "session": info["session"],
-                "condition": info["condition"],
-                "timestamp": ts,
-                "agreed": True,
-                "signature_base64": consent_win.canvas.to_base64_png(),
-            }
-            with open(record_path, "w") as f:
-                json.dump(record, f, indent=2)
             info["consent_signed"] = True
-            info["consent_record"] = record_path
-            _log("consent saved to %s" % record_path)
 
         info["started_at"] = ts
-        _save_session_record(pdir, info, ts)
-        try:
-            with open(os.path.join(BASE_DIR, "current_session.json"), "w") as f:
-                json.dump(info, f, indent=2)
-        except Exception:
-            _log(traceback.format_exc())
 
         _log("gateway completed: %s" % info)
         return info

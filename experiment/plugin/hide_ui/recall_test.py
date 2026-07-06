@@ -1,12 +1,14 @@
 """Command-location recall test after each tutorial block."""
 
-import json
+import html
 import os
 import random
 import traceback
-from datetime import datetime
+from pathlib import Path
 
-from .experiment import BASE_DIR, _log
+PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+COMMANDS_DIR = os.path.join(PLUGIN_DIR, "commands")
+
 from .session_flow import run_tutorial_intro
 
 RECALL_QUESTION_TIME_SEC = 10
@@ -20,6 +22,16 @@ RECALL_TIME_SEC = RECALL_QUESTION_TIME_SEC
 RECALL_SIDE_PANEL = {
     "title": "Command recall test",
     "body": (
+        "Some commands are hidden under white boxes on the Krita interface.\n\n"
+        "Read each question in the bar at the top of Krita.\n\n"
+        "Click the white box where you think that command is.\n\n"
+        "Answer as quickly and accurately as you can."),
+}
+
+RECALL_PRACTICE_SIDE_PANEL = {
+    "title": "Command recall test",
+    "body": (
+        "This is a practice trial.\n\n"
         "Some commands are hidden under white boxes on the Krita interface.\n\n"
         "Read each question in the bar at the top of Krita.\n\n"
         "Click the white box where you think that command is.\n\n"
@@ -131,6 +143,41 @@ RECALL_ANSWER_ALIASES = {
 
 RECALL_QUESTIONS = RECALL_QUESTIONS_ALL
 
+# Maps recall question id to command PNG under commands/ (shown in the prompt).
+RECALL_QUESTION_ICONS = {
+    "brush_tool": "Freehand Brush Tool.png",
+    "move_tool": "Move Tool.png",
+    "line_tool": "Straight Line Tool.png",
+    "rectangle_tool": "Rectangle Tool.png",
+    "ellipse_tool": "Ellipse Tool.png",
+    "fill_tool": "Fill Tool.png",
+    "gradient_tool": "Gradient Tool.png",
+    "text_tool": "Text tool.png",
+    "brush_preset": "Brush Preset.png",
+    "eraser_preset": "Eraser Preset.png",
+    "add_layer": "Add layer.png",
+    "delete_layer": "Delete layer.png",
+    "raise_layer": "Move up.png",
+    "lower_layer": "Move down.png",
+}
+
+
+def format_recall_prompt_html(question):
+    """Return (text, rich_text) for the recall question banner."""
+    prompt = question.get("prompt") or ""
+    icon_file = RECALL_QUESTION_ICONS.get(question.get("id"))
+    if not icon_file:
+        return prompt, False
+    icon_path = os.path.join(COMMANDS_DIR, icon_file)
+    if not os.path.isfile(icon_path):
+        return prompt, False
+    icon_url = html.escape(Path(icon_path).as_uri())
+    text = (
+        '<span style="font-size:18px; font-weight:bold;">%s</span>'
+        ' <img src="%s" height="28" style="vertical-align:middle;" />'
+        % (html.escape(prompt), icon_url))
+    return text, True
+
 
 def _normalize_recall_cmd(cmd):
     """Normalize answer ids for comparison (preset stems vary by case)."""
@@ -197,48 +244,14 @@ def recall_timing(trial=False):
     }
 
 
-def recall_side_panel_message(opening=False):
+def recall_side_panel_message(opening=False, practice=False):
     if opening:
         return dict(RECALL_OPENING_SIDE_PANEL)
+    if practice:
+        return dict(RECALL_PRACTICE_SIDE_PANEL)
     return dict(RECALL_SIDE_PANEL)
 
 
 def run_recall_intro():
     """Legacy fullscreen intro (not used during recall UI)."""
     return run_tutorial_intro(RECALL_INTRO["title"], RECALL_INTRO["body"])
-
-
-def save_recall_results(session, results, recall_meta=None, score_percent=None):
-    """Persist recall clicks/timings under the participant data folder."""
-    if not session or not results:
-        return None
-    try:
-        pid = session.get("participant_id")
-        if not pid:
-            return None
-        pdir = os.path.join(BASE_DIR, pid)
-        os.makedirs(pdir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(pdir, "recall_%s.json" % ts)
-        meta = dict(recall_meta or {})
-        payload = {
-            "participant_id": pid,
-            "session": session.get("session"),
-            "condition": session.get("condition"),
-            "timestamp": ts,
-            "time_limit_sec": meta.get(
-                "question_time_sec", RECALL_QUESTION_TIME_SEC),
-            "phase_time_limit_sec": meta.get("phase_time_sec"),
-            "recall_trial": bool(meta.get("trial")),
-            "question_count": meta.get("question_count"),
-            "responses": results,
-        }
-        if score_percent is not None:
-            payload["score_percent"] = int(score_percent)
-        with open(path, "w") as f:
-            json.dump(payload, f, indent=2)
-        _log("recall results saved to %s" % path)
-        return path
-    except Exception:
-        _log(traceback.format_exc())
-        return None

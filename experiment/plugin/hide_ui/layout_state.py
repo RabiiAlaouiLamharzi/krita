@@ -11,7 +11,9 @@ import base64
 import os
 import traceback
 
-STATE_DIR = os.path.expanduser("~/krita_experiment_data/layout_states")
+from .experiment import BASE_DIR
+
+STATE_DIR = os.path.join(os.path.dirname(BASE_DIR), "layout_states")
 # Bump when the docker set / capture semantics change so stale blobs
 # from older plugin versions are ignored.
 # v2: captures are verification-gated; v1 blobs may hold unsettled layouts.

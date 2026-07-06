@@ -14,9 +14,12 @@ SHORTCUTS_DEST="$KRITA_SUPPORT/shortcuts"
 mkdir -p "$KRITA_SUPPORT/pykrita"
 mkdir -p "$SHORTCUTS_DEST"
 
+mkdir -p "$ROOT/participant_data"
+
 # Clear cached native layout-state blobs so they regenerate for this plugin version.
-rm -rf "$HOME/krita_experiment_data/layout_states"
+rm -rf "$ROOT/layout_states"
 rsync -a --delete --exclude '__pycache__' "$ROOT/plugin/hide_ui/" "$PLUGIN_DEST/"
+echo "$ROOT/participant_data" > "$PLUGIN_DEST/data_root.txt"
 cp "$ROOT/plugin/hide_ui.desktop" "$KRITA_SUPPORT/pykrita/"
 cp "$ROOT/config/krita5.xmlgui" "$KRITA_SUPPORT/"
 cp "$ROOT/config/study_none.shortcuts" "$SHORTCUTS_DEST/study_none.shortcuts"

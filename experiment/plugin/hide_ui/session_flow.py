@@ -3,16 +3,17 @@
 import random
 import traceback
 
-from PyQt5.QtCore import Qt, QTimer, QRectF
+from PyQt5.QtCore import Qt, QTimer, QRectF, QEventLoop
 from PyQt5.QtGui import QPainter, QColor
 from PyQt5.QtWidgets import (
-    QLabel, QPushButton, QVBoxLayout, QWidget, QApplication, QSizePolicy)
+    QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QWidget, QApplication,
+    QSizePolicy, QLineEdit)
 
 from .experiment import GatewayWindow, suppress_krita_ui, _log
 
 TUTORIAL_LEARN_SEC = 600        # 10 min — Session 1 tutorials 2–3, all Session 2 tutorials
 TUTORIAL_PRACTICE_SEC = 900     # 15 min — Session 1 practice trial only
-BREAK_SEC = 10                  # 10 s break between blocks
+BREAK_SEC = 120                 # 2 min break between blocks
 TUTORIAL_1_TIME_SEC = TUTORIAL_PRACTICE_SEC
 TUTORIAL_2_TIME_SEC = TUTORIAL_LEARN_SEC
 TUTORIAL_3_TIME_SEC = TUTORIAL_LEARN_SEC
@@ -21,9 +22,8 @@ TUTORIAL_TIME_SEC = TUTORIAL_1_TIME_SEC
 BREAK_MESSAGE = {
     "title": "Break",
     "body": (
-        "This is a break.\n\n"
-        "You can practise in Krita if you want, but you do not have to.\n\n"
-        "The next block will start automatically when the timer ends."),
+        "This is a 2-minute break.\n\n"
+        "Please rest."),
 }
 
 
@@ -56,8 +56,8 @@ def _tutorial_time_label(seconds):
 
 def _learn_body(seconds, extra=""):
     base = (
-        "Watch the tutorial video on the right.\n\n"
-        "Mimic what you see in Krita. Use the same tools and actions.\n\n"
+        "Follow the step-by-step instructions on the right.\n\n"
+        "Work through each step in Krita.\n\n"
         "You will have %s to practice when the canvas opens."
         % _tutorial_time_label(seconds)
     )
@@ -70,8 +70,9 @@ TUTORIAL_1 = {
     "title": "Tutorial 1: Practice trial",
     "body": _learn_body(
         TUTORIAL_PRACTICE_SEC,
-        "This first block is a practice trial. Your answers here are not recorded."),
-    "logged": False,
+        "This first block is a practice trial. "
+        "You will first watch a short introduction to the Krita workspace."),
+    "logged": True,
     "learn_sec": TUTORIAL_PRACTICE_SEC,
 }
 
@@ -90,6 +91,10 @@ TUTORIAL_3 = {
 }
 
 SESSION_1_TUTORIALS = (TUTORIAL_1, TUTORIAL_2, TUTORIAL_3)
+
+STUDY_PRESENTATION = (
+    "Krita is a drawing program. For this study you use a simplified version.\n\n"
+    "Watch the video below for a quick tour of your workspace.")
 
 SESSION_2_OPENING_RECALL = {
     "title": "Recall: Layout A",
@@ -111,7 +116,7 @@ HOLD_AFTER_TUTORIAL = {
         "title": "Tutorial 1 complete",
         "body": (
             "Nice work.\n\n"
-            "When you press Continue, you will take a short recall test, "
+            "When you press Continue, you will take a practice recall test, "
             "then Learning Tutorial 2 will begin."),
     },
     2: {
@@ -214,6 +219,128 @@ def run_tutorial_intro(title, body):
 def run_hold_screen(title, body):
     """Transition screen between tutorial blocks."""
     return run_tutorial_intro(title, body)
+
+
+def _format_countdown(seconds_left):
+    sec = max(0, int(seconds_left))
+    minutes, seconds = divmod(sec, 60)
+    return "%d:%02d" % (minutes, seconds)
+
+
+class TimedBreakWindow(GatewayWindow):
+    """Standalone break screen with countdown; Krita stays hidden."""
+
+    def __init__(self, title, body, duration_sec, skip_password=None):
+        super().__init__(title)
+        self._remaining = max(1, int(duration_sec))
+        self._skip_password = skip_password
+        self._tick = QTimer(self)
+        self._tick.setInterval(1000)
+        self._tick.timeout.connect(self._on_tick)
+
+        heading = QLabel(title)
+        heading.setAlignment(Qt.AlignCenter)
+        heading.setStyleSheet(
+            "color: #ffffff; font-size: 24px; font-weight: bold; padding: 0 12px;")
+
+        self._timer_label = QLabel(_format_countdown(self._remaining))
+        self._timer_label.setAlignment(Qt.AlignCenter)
+        self._timer_label.setStyleSheet(
+            "color: #ffffff; font-size: 64px; font-weight: bold; padding: 12px;")
+
+        inner = QWidget()
+        inner.setMinimumWidth(480)
+        inner.setMaximumWidth(560)
+        lay = QVBoxLayout(inner)
+        lay.setSpacing(12)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.addWidget(heading)
+        lay.addSpacing(8)
+        for para in body.strip().split("\n\n"):
+            text = para.strip()
+            if not text:
+                continue
+            desc = QLabel(text)
+            desc.setWordWrap(True)
+            desc.setAlignment(Qt.AlignCenter)
+            desc.setStyleSheet(
+                "color: #f2f2f2; font-size: 15px; padding: 4px 12px;")
+            lay.addWidget(desc)
+        lay.addSpacing(16)
+        lay.addWidget(self._timer_label)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        if skip_password:
+            skip_btn = QPushButton("Skip break")
+            skip_btn.setObjectName("quitBtn")
+            skip_btn.clicked.connect(self._try_skip)
+            footer.addWidget(skip_btn)
+        lay.addLayout(footer)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(40, 36, 40, 36)
+        outer.addStretch(1)
+        outer.addWidget(inner, 0, Qt.AlignCenter)
+        outer.addStretch(1)
+
+        inner.adjustSize()
+        self.adjustSize()
+        self.setMinimumSize(560, max(360, inner.sizeHint().height() + 140))
+
+    def _try_skip(self):
+        if not self._skip_password:
+            return
+        from PyQt5.QtWidgets import QInputDialog
+        entered, ok = QInputDialog.getText(
+            self,
+            "Skip break",
+            "Enter the skip password for this break:",
+            QLineEdit.Password)
+        if ok and entered == self._skip_password:
+            _log("break skipped: %s" % self._skip_password)
+            self._finish(True)
+
+    def _on_tick(self):
+        self._remaining -= 1
+        self._timer_label.setText(_format_countdown(self._remaining))
+        if self._remaining <= 0:
+            self._tick.stop()
+            self._finish(True)
+
+    def run_blocking(self):
+        loop = QEventLoop()
+        self._loop = loop
+        guard = QTimer()
+        guard.setInterval(100)
+        guard.timeout.connect(lambda: suppress_krita_ui(self))
+        guard.start()
+        self._center_on_screen()
+        suppress_krita_ui(self)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self._tick.start()
+        loop.exec_()
+        self._tick.stop()
+        guard.stop()
+        self._loop = None
+        return self._result
+
+
+def run_timed_break(skip_password=None):
+    """Show timed break window. Returns True when finished, False if cancelled."""
+    try:
+        win = TimedBreakWindow(
+            BREAK_MESSAGE["title"],
+            BREAK_MESSAGE["body"],
+            BREAK_SEC,
+            skip_password=skip_password)
+        suppress_krita_ui(win)
+        return win.run_blocking() is True
+    except Exception:
+        _log(traceback.format_exc())
+        return False
 
 
 class RecallScoreWindow(GatewayWindow):

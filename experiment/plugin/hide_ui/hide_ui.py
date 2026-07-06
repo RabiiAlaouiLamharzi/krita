@@ -217,7 +217,8 @@ class _RecallQuestionBanner(QFrame):
             "QFrame { background-color: rgba(255, 243, 205, 0.96);"
             " border: 2px solid #e6c200; border-radius: 6px; }")
 
-    def set_question(self, text):
+    def set_question(self, text, rich=False):
+        self._text.setTextFormat(Qt.RichText if rich else Qt.PlainText)
         self._text.setText(text or "")
 
 
@@ -521,9 +522,11 @@ class HideUIExtension(Extension):
         self._recall_overlay_generation = 0
         self._recall_app_filter_active = False
         self._session_tutorial_index = 0
+        self._active_learn_num = 0
         self._session2_running = False
         self._after_recall_fn = None
         self._recall_skip_save = False
+        self._recall_end_reason = "ended"
         self._break_active = False
         self._recall_panel_message = None
         self._study_layout_profile = "A"
@@ -538,6 +541,13 @@ class HideUIExtension(Extension):
         self._preset_dock_placeholder = None
         self._recall_layout_profile_override = None
         self._learning_layout_profile = "A"
+        self._learning_tracker = None
+        self._learning_steps = None
+        self._learning_step_index = 0
+        self._learning_done_cb = None
+        self._learning_panel_title = ""
+        self._learning_panel_phase = 1
+        self._learning_phase_finished = False
         self._study_brush_size = None
         self._brush_size_sync_hooked = False
         self._phase_transition_busy = False
@@ -716,6 +726,12 @@ class HideUIExtension(Extension):
     def _is_session1(self):
         return bool(self.session and self.session.get("session") == 1)
 
+    def _learning_uses_phase_timer(self):
+        """Session 1 and 2 learning blocks use the phase countdown (all conditions)."""
+        if not self.session:
+            return False
+        return int(self.session.get("session", 0) or 0) in (1, 2)
+
     def _in_session1_flow(self):
         return bool(
             self._session1_running or self._session2_running
@@ -888,6 +904,11 @@ class HideUIExtension(Extension):
             if answer != QMessageBox.Yes:
                 return
         self._quitting = True
+        try:
+            from .experiment_log import end_session
+            end_session("quit")
+        except Exception:
+            pass
         _log("request_quit: clean shutdown (force=%s)" % force)
         try:
             self._stop_recall_click_capture()
@@ -1049,6 +1070,7 @@ class HideUIExtension(Extension):
                     t.setMovable(False)
                     t.setFloatable(False)
                     t.show()
+            self._order_study_toolbar(qwin)
             self._ensure_study_dockers_visible(qwin)
         except Exception:
             _log(traceback.format_exc())
@@ -1359,6 +1381,15 @@ class HideUIExtension(Extension):
         except Exception:
             _log(traceback.format_exc())
 
+    def _on_new_session_started(self):
+        """Reset per-session UI state when a new run folder is opened."""
+        self._ui_applied = False
+        self._study_layout_applied_sig = None
+        self._study_layout_profile = "A"
+        self._learning_tracker = None
+        self._learning_steps = None
+        self._recall_layout_profile_override = None
+
     def _run_gateway(self, qwin):
         if self._gateway_done:
             return
@@ -1374,6 +1405,9 @@ class HideUIExtension(Extension):
                 self._request_quit(force=True)
                 return
             self.session = info
+            from .experiment_log import start_session
+            start_session(self.session)
+            self._on_new_session_started()
             self._gateway_ok = True
             self._ensure_shortcuts_blocked(qwin)
             try:
@@ -1573,12 +1607,6 @@ class HideUIExtension(Extension):
                 return
             self._video_panel = panel
             layout = self._compute_layout(qwin)
-            if self._break_active:
-                from .session_flow import BREAK_MESSAGE
-                panel.show_break_panel(
-                    layout["video_pos"], layout["video_size"],
-                    BREAK_MESSAGE["title"], BREAK_MESSAGE["body"])
-                return
             if self._recall_active:
                 msg = getattr(self, "_recall_panel_message", None) or {}
                 from .recall_test import RECALL_SIDE_PANEL
@@ -1586,6 +1614,17 @@ class HideUIExtension(Extension):
                 body = msg.get("body", RECALL_SIDE_PANEL["body"])
                 panel.show_recall_instructions_panel(
                     layout["video_pos"], layout["video_size"], title, body)
+                return
+            if self._tutorial_active and self._should_show_video(qwin):
+                if self._learning_steps:
+                    self._refresh_learning_step_panel(qwin)
+                else:
+                    from .learning_instructions import get_learning_instructions
+                    learn_num = int(getattr(self, "_active_learn_num", 1) or 1)
+                    inst = get_learning_instructions(self.session, learn_num)
+                    panel.show_learning_instructions_panel(
+                        layout["video_pos"], layout["video_size"],
+                        inst["title"], inst["steps"], inst.get("phase", 1))
                 return
             if not self._should_show_video(qwin):
                 self._video_shown_for_canvas = False
@@ -1800,19 +1839,67 @@ class HideUIExtension(Extension):
                     tb_lay.setContentsMargins(0, 0, 0, 0)
                     tb_lay.setSpacing(0)
 
-            if not self._study_toolbar_ready:
-                anchor = qwin.findChild(QToolBar, "mainToolBar")
-                if anchor is not None:
-                    qwin.insertToolBar(anchor, self._study_toolbar)
-                    qwin.insertToolBarBreak(anchor)
-                else:
-                    qwin.addToolBar(Qt.TopToolBarArea, self._study_toolbar)
-                    qwin.addToolBarBreak(Qt.TopToolBarArea)
-                self._study_toolbar_ready = True
-
+            self._order_study_toolbar(qwin)
             self._study_toolbar.show()
         except Exception:
             _log(traceback.format_exc())
+
+    def _first_native_toolbar(self, qwin):
+        for name in NATIVE_TOOLBARS + ("mainToolBar",):
+            tb = qwin.findChild(QToolBar, name)
+            if tb is not None and _qt_alive(tb) and tb.isVisible():
+                return tb
+        for tb in qwin.findChildren(QToolBar):
+            if (tb.objectName() != STUDY_CHROME_TOOLBAR
+                    and _qt_alive(tb) and tb.isVisible()):
+                return tb
+        return None
+
+    def _study_toolbar_needs_reorder(self, qwin):
+        """Study chrome must sit on row 1; undo/redo + brush size on row 2."""
+        study = self._study_toolbar
+        native = self._first_native_toolbar(qwin)
+        if study is None or native is None or not _qt_alive(study):
+            return False
+        if not study.isVisible() or not native.isVisible():
+            return False
+        # Same row or study below native → wrong stacking.
+        return study.y() >= native.y() - 2
+
+    def _order_study_toolbar(self, qwin):
+        """Row 1: close / skip / timer. Row 2: Krita undo-redo and brush size."""
+        if not _qt_alive(qwin) or self._study_toolbar is None:
+            return
+        try:
+            study = self._study_toolbar
+            anchor = self._first_native_toolbar(qwin)
+            if anchor is None:
+                if not self._study_toolbar_ready:
+                    qwin.addToolBar(Qt.TopToolBarArea, study)
+                    qwin.addToolBarBreak(Qt.TopToolBarArea)
+                    self._study_toolbar_ready = True
+                study.show()
+                return
+
+            same_row = abs(study.y() - anchor.y()) < 8
+            needs = (not self._study_toolbar_ready
+                     or self._study_toolbar_needs_reorder(qwin))
+            if needs:
+                qwin.removeToolBar(study)
+                qwin.insertToolBar(anchor, study)
+                if same_row or study.y() >= anchor.y() - 2:
+                    qwin.insertToolBarBreak(anchor)
+                self._study_toolbar_ready = True
+            study.show()
+        except Exception:
+            _log(traceback.format_exc())
+
+    def _schedule_study_toolbar_order(self, qwin):
+        """Re-apply toolbar row order after async layout restores (recall)."""
+        self._order_study_toolbar(qwin)
+        for delay in (80, 250, 600, 1500):
+            QTimer.singleShot(
+                delay, lambda q=qwin: self._order_study_toolbar(q))
 
     def _lock_window(self, qwin, show=True):
         """Fixed Krita window on the left; video panel on the right."""
@@ -2907,6 +2994,7 @@ class HideUIExtension(Extension):
         self._lock_dock_splitters(qwin)
         self._lock_dock_panel_heights(qwin)
         self._apply_all_dock_titles(qwin)
+        self._order_study_toolbar(qwin)
 
     def _expected_dock_areas(self, profile):
         """Dock area each of the four study dockers must occupy per profile.
@@ -3269,6 +3357,8 @@ class HideUIExtension(Extension):
             self._suppress_canvas_floating_messages(self._qwin)
             if self._study_toolbar is not None:
                 self._study_toolbar.show()
+            if self._recall_active:
+                self._order_study_toolbar(self._qwin)
             if not self._quitting:
                 if self._break_active or self._recall_active:
                     self._update_video_panel(self._qwin)
@@ -3380,21 +3470,18 @@ class HideUIExtension(Extension):
                         window_title="Skip recall"):
                     return
                 _log("recall phase skipped: %s" % expected)
+                from .experiment_log import log_t
+                log_t("skip", phase="recall",
+                      learn_num=int(self._current_recall_learn_num or 0))
                 if self._qwin_alive():
                     self._skip_recall_phase(self._qwin)
                 return
-            if not self._tutorial_timer_done_cb:
+            if not self._learning_done_cb:
                 return
-            if self._break_active:
-                learn_num = self._current_break_learn_num
-                dlg_title = "Enter the skip password for this break."
-                win_title = "Skip break"
-                phase = "break"
-            else:
-                learn_num = self._current_learning_num
-                dlg_title = "Enter the skip password for this learning phase."
-                win_title = "Skip learning phase"
-                phase = "learning"
+            learn_num = self._current_learning_num
+            dlg_title = "Enter the skip password for this learning phase."
+            win_title = "Skip learning phase"
+            phase = "learning"
             expected = self._learning_skip_password(learn_num)
             if not expected:
                 _log("%s skip rejected: no password configured" % phase)
@@ -3403,7 +3490,7 @@ class HideUIExtension(Extension):
             if not dlg.run(expected, title=dlg_title, window_title=win_title):
                 return
             _log("%s phase skipped: %s" % (phase, expected))
-            self._finish_tutorial_timer_early()
+            self._finish_learning_phase("experimenter_skip")
         finally:
             if QApplication.activeModalWidget() is None:
                 self._recall_input_blocked = False
@@ -3417,6 +3504,7 @@ class HideUIExtension(Extension):
             self._recall_timer.stop()
         self._set_skip_recall_visible(False)
         self._set_recall_timer_visible(False)
+        self._recall_end_reason = "experimenter_skip"
         self._finish_recall_phase(qwin)
 
     def _finish_tutorial_timer_early(self):
@@ -3530,6 +3618,335 @@ class HideUIExtension(Extension):
                 self._timer_label.setStyleSheet(TIMER_STYLE_NORMAL)
         except Exception:
             _log(traceback.format_exc())
+
+    def _learning_phase_index(self, learn_num):
+        from .learning_instructions import _phase_index
+        session_num = 1
+        if self.session:
+            session_num = int(self.session.get("session", 1) or 1)
+        return _phase_index(session_num, int(learn_num or 1))
+
+    def _start_learning_event_tracking(self, qwin, learn_num):
+        if self._quitting or not self.session:
+            return
+        try:
+            from .learning_instructions import get_learning_instructions
+            from .learning_tracker import LearningTracker
+            from .experiment_log import log_learning_step
+            inst = get_learning_instructions(self.session, learn_num)
+            if self._learning_tracker is None:
+                self._learning_tracker = LearningTracker(log_learning_step)
+            self._learning_tracker.start(
+                learn_num, inst.get("phase", 1), inst.get("steps", []))
+            self._ensure_learning_click_hooks(qwin)
+            self._ensure_text_app_filter()
+        except Exception:
+            _log(traceback.format_exc())
+
+    def _save_learning_drawing(self, learn_num):
+        """Save PNG to run_folder/learning_drawings/tutorial_N/drawing.png"""
+        try:
+            import os
+            from krita import Krita
+            from .experiment_log import learning_drawing_path
+
+            path = learning_drawing_path(int(learn_num or 0))
+            if not path:
+                _log("learning export: no run folder")
+                return
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+
+            if self._qwin_alive():
+                self._focus_canvas(self._qwin)
+            QApplication.processEvents()
+
+            k = Krita.instance()
+            doc = None
+            win = k.activeWindow()
+            if win is not None:
+                view = win.activeView()
+                if view is not None:
+                    doc = view.document()
+            if doc is None:
+                doc = k.activeDocument()
+            if doc is None:
+                docs = list(k.documents())
+                doc = docs[-1] if docs else None
+            if doc is None:
+                _log("learning export: no document open")
+                return
+
+            doc.waitForDone()
+            doc.refreshProjection()
+            doc.waitForDone()
+            QApplication.processEvents()
+
+            image = doc.projection()
+            if image is None or image.isNull():
+                try:
+                    bounds = doc.bounds()
+                    tw = max(1, min(int(bounds.width()), 2400))
+                    th = max(1, min(int(bounds.height()), 2400))
+                    image = doc.thumbnail(tw, th)
+                except Exception:
+                    image = doc.thumbnail(1200, 1200)
+
+            if image is None or image.isNull():
+                _log("learning export: could not read canvas image")
+                return
+
+            if not image.save(path, "PNG"):
+                _log("learning export: QImage.save failed for %s" % path)
+                return
+
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                _log("learning export saved: %s" % path)
+            else:
+                _log("learning export: file missing after save %s" % path)
+        except Exception:
+            _log(traceback.format_exc())
+
+    def _stop_learning_event_tracking(self, learn_num=0):
+        try:
+            if self._learning_tracker is not None:
+                self._learning_tracker.stop()
+        except Exception:
+            _log(traceback.format_exc())
+
+    def _refresh_learning_step_panel(self, qwin=None):
+        if not self._learning_steps:
+            return
+        qwin = qwin or self._qwin
+        if not self._qwin_alive() or not _qt_alive(qwin):
+            return
+        self._ensure_learning_click_hooks(qwin)
+        try:
+            from .video_panel import get_video_panel
+            panel = get_video_panel()
+            if panel is None:
+                return
+            self._video_panel = panel
+            layout = self._compute_layout(qwin)
+            idx = int(self._learning_step_index or 0)
+            idx = max(0, min(idx, len(self._learning_steps) - 1))
+            panel.show_learning_step_panel(
+                layout["video_pos"], layout["video_size"],
+                self._learning_panel_title,
+                self._learning_steps[idx],
+                idx + 1,
+                len(self._learning_steps),
+                phase=self._learning_panel_phase,
+                on_next=self._on_learning_step_next,
+                on_back=self._on_learning_step_back)
+        except Exception:
+            _log(traceback.format_exc())
+
+    def _on_learning_step_next(self):
+        if self._learning_phase_finished or not self._learning_steps:
+            return
+        learn_num = int(self._current_learning_num or 0)
+        is_last = self._learning_step_index >= len(self._learning_steps) - 1
+        tracker = self._learning_tracker
+        if tracker is not None and tracker.active:
+            tracker.on_step_next()
+        if is_last:
+            self._finish_learning_phase("completed")
+            return
+        self._learning_step_index += 1
+        if self._qwin_alive():
+            self._refresh_learning_step_panel(self._qwin)
+
+    def _on_learning_step_back(self):
+        if self._learning_phase_finished or not self._learning_steps:
+            return
+        if self._learning_step_index <= 0:
+            return
+        tracker = self._learning_tracker
+        if tracker is not None and tracker.active:
+            tracker.on_step_back()
+        self._learning_step_index -= 1
+        if self._qwin_alive():
+            self._refresh_learning_step_panel(self._qwin)
+
+    def _finish_learning_phase(self, reason="completed"):
+        if self._learning_phase_finished:
+            return
+        self._learning_phase_finished = True
+        learn_num = int(self._current_learning_num or 0)
+        self._set_skip_learning_visible(False)
+        self._set_tutorial_timer_visible(False)
+        if self._tutorial_timer is not None:
+            self._tutorial_timer.stop()
+            self._tutorial_timer = None
+        self._tutorial_remaining_sec = None
+        self._stop_timer_blink()
+        self._save_learning_drawing(learn_num)
+        self._stop_learning_event_tracking(learn_num)
+        from .experiment_log import log_e
+        log_e(
+            "learning",
+            action="end",
+            phase=self._learning_phase_index(learn_num),
+            learn_num=learn_num,
+            reason=reason)
+        self._learning_steps = None
+        cb = self._learning_done_cb
+        self._learning_done_cb = None
+        if self._qwin_alive():
+            self._soft_pause_tutorial(self._qwin)
+        if cb is not None:
+            cb()
+
+    def _start_step_by_step_learning(self, on_done, learn_num=0, time_sec=None):
+        """Learning with step-by-step instructions; session 1 also runs a phase timer."""
+        if self._quitting:
+            return
+        self._learning_done_cb = on_done
+        self._learning_phase_finished = False
+        self._current_learning_num = int(learn_num or 0)
+        self._set_skip_recall_visible(False)
+        self._set_skip_learning_visible(True)
+        phase_seconds = int(time_sec) if time_sec else 0
+        self._set_tutorial_timer_visible(
+            bool(phase_seconds), phase_seconds if phase_seconds else 0)
+        from .learning_instructions import get_learning_instructions
+        from .experiment_log import log_e
+        inst = get_learning_instructions(self.session, learn_num)
+        self._learning_steps = list(inst.get("steps", []))
+        self._learning_step_index = 0
+        self._learning_panel_title = inst.get("title", "")
+        self._learning_panel_phase = int(inst.get("phase", 1) or 1)
+        log_fields = dict(
+            action="start",
+            phase=self._learning_phase_index(learn_num),
+            learn_num=int(learn_num or 0),
+            layout=str(getattr(self, "_study_layout_profile", "")),
+            practice=bool(self._is_session1() and int(learn_num or 0) == 1))
+        if phase_seconds:
+            log_fields["duration_sec"] = phase_seconds
+        log_e("learning", **log_fields)
+        from .experiment_log import learning_drawing_path
+        learning_drawing_path(int(learn_num or 0))
+        self._start_learning_event_tracking(self._qwin, learn_num)
+        if self._qwin_alive():
+            self._refresh_learning_step_panel(self._qwin)
+        if phase_seconds:
+            self._start_learning_phase_timer(phase_seconds)
+
+    def _start_learning_phase_timer(self, seconds):
+        """Countdown for session 1 learning blocks (step-by-step UI stays active)."""
+        if self._quitting or seconds <= 0:
+            return
+        self._timer_urgent_enabled = True
+        self._tutorial_phase_sec = int(seconds)
+        self._tutorial_remaining_sec = max(0, int(seconds))
+        if self._tutorial_timer is not None:
+            self._tutorial_timer.stop()
+        self._tutorial_timer = QTimer()
+        remaining = [self._tutorial_remaining_sec]
+
+        def tick():
+            remaining[0] -= 1
+            self._tutorial_remaining_sec = max(0, remaining[0])
+            self._update_timer_display(self._tutorial_remaining_sec)
+            if remaining[0] <= 0:
+                self._tutorial_timer.stop()
+                if not self._learning_phase_finished:
+                    self._finish_learning_phase("timer")
+
+        self._tutorial_timer.timeout.connect(tick)
+        self._update_timer_display(remaining[0])
+        self._tutorial_timer.start(1000)
+
+    def _learning_click_active(self):
+        return (self._tutorial_active and not self._recall_active
+                and self._learning_tracker is not None
+                and self._learning_tracker.active)
+
+    def _ensure_learning_click_hooks(self, qwin):
+        if not _qt_alive(qwin):
+            return
+        self._ensure_text_app_filter()
+        self._hook_learning_preset_clicks(qwin)
+        self._hook_learning_toolbox_clicks(qwin)
+
+    def _hook_learning_preset_clicks(self, qwin):
+        roots = []
+        dock = self._dock_by_name(qwin, "PresetDocker")
+        if dock is not None:
+            roots.append(dock)
+        if self._preset_popup_widget is not None:
+            roots.append(self._preset_popup_widget)
+        for root in roots:
+            for view in root.findChildren(QAbstractItemView):
+                if view.property("hideui_learning_preset_click"):
+                    continue
+                try:
+                    view.clicked.connect(
+                        lambda idx, v=view: self._on_learning_preset_clicked(
+                            v, idx))
+                except Exception:
+                    pass
+                view.setProperty("hideui_learning_preset_click", True)
+
+    def _on_learning_preset_clicked(self, view, index):
+        if not self._learning_click_active():
+            return
+        try:
+            model = view.model()
+            if model is None or not index.isValid():
+                return
+            name = model.data(index)
+            if name is None:
+                name = model.data(index, Qt.DisplayRole)
+            if name:
+                self._learning_tracker.on_preset_clicked(str(name))
+        except Exception:
+            _log(traceback.format_exc())
+
+    def _hook_learning_toolbox_clicks(self, qwin):
+        dock = self._dock_by_name(qwin, "ToolBox")
+        if dock is None:
+            return
+        for btn in dock.findChildren(QToolButton):
+            if not self._keep_toolbox_button(btn):
+                continue
+            if btn.property("hideui_learning_tool_click"):
+                continue
+            try:
+                btn.clicked.connect(
+                    lambda checked=False, b=btn: self._log_learning_tool_clicked(
+                        b))
+            except Exception:
+                pass
+            btn.setProperty("hideui_learning_tool_click", True)
+
+    def _log_learning_tool_clicked(self, btn):
+        if not self._learning_click_active():
+            return
+        if not isinstance(btn, QToolButton):
+            return
+        from .learning_tracker import toolbox_command_name
+        cmd = toolbox_command_name(btn.objectName())
+        if cmd:
+            self._learning_tracker.on_tool_selected(cmd)
+
+    def _log_learning_color_clicked(self):
+        if not self._learning_click_active():
+            return
+        self._learning_tracker.on_color_wheel_clicked()
+
+    def _log_learning_layer_button(self, button_name):
+        if not self._learning_click_active():
+            return
+        mapping = {
+            "bnDelete": ("layer_deleted", "Delete layer"),
+            "bnRaise": ("layer_moved_up", "Move up"),
+            "bnLower": ("layer_moved_down", "Move down"),
+        }
+        pair = mapping.get(button_name)
+        if pair:
+            self._learning_tracker.on_layer_event(pair[0], pair[1])
 
     def _wait_for_tutorial_timer(self, seconds, on_done, skippable=False,
                                 learn_num=0, urgent=True, break_learn_num=0):
@@ -4140,6 +4557,7 @@ class HideUIExtension(Extension):
             self._present_krita(qwin)
             self._ensure_study_chrome(qwin)
             self._show_study_toolbars(qwin)
+            self._schedule_study_toolbar_order(qwin)
             self._ensure_study_dockers_visible(qwin)
             if self._recall_mask_state:
                 self._unmask_recall_commands(qwin)
@@ -4364,11 +4782,13 @@ class HideUIExtension(Extension):
         banner.show()
         banner.raise_()
 
-    def _show_recall_question(self, qwin, text):
+    def _show_recall_question(self, qwin, question):
+        from .recall_test import format_recall_prompt_html
         banner = self._ensure_recall_question_banner(qwin)
         if banner is None:
             return
-        banner.set_question(text)
+        text, rich = format_recall_prompt_html(question)
+        banner.set_question(text, rich=rich)
         banner.show()
         self._position_recall_question_banner(qwin)
 
@@ -4547,8 +4967,7 @@ class HideUIExtension(Extension):
         if self._quitting:
             return
         try:
-            from .recall_test import (
-                prepare_recall_questions, recall_timing, save_recall_results)
+            from .recall_test import prepare_recall_questions, recall_timing
             trial = bool(self._recall_skip_save)
             self._recall_meta = recall_timing(trial=trial)
             self._recall_questions = prepare_recall_questions(trial=trial)
@@ -4557,12 +4976,25 @@ class HideUIExtension(Extension):
             self._recall_question_time_sec = self._recall_meta["question_time_sec"]
             self._recall_phase_time_sec = self._recall_meta.get("phase_time_sec")
             self._recall_phase_remaining_sec = self._recall_phase_time_sec
-            self._save_recall_results_fn = save_recall_results
             self._recall_cold_attempts = 0
             _log("recall phase: trial=%s questions=%d q_time=%ss phase=%ss" % (
                 trial, len(self._recall_questions),
                 self._recall_question_time_sec,
                 self._recall_phase_time_sec or "none"))
+            learn_num = int(getattr(self, "_pending_recall_learn_num", 0) or 0)
+            from .experiment_log import log_e, register_recall_questions
+            log_e(
+                "recall",
+                action="start",
+                learn_num=learn_num,
+                trial=trial,
+                opening=bool(
+                    self.session
+                    and int(self.session.get("session", 0) or 0) == 2
+                    and learn_num == 0),
+                question_count=len(self._recall_questions or []),
+                layout=str(getattr(self, "_study_layout_profile", "")))
+            register_recall_questions(self._recall_questions, learn_num=learn_num)
             self._prepare_recall_canvas(
                 qwin, lambda ok: self._on_fresh_canvas_for_recall(qwin, ok))
         except Exception:
@@ -4644,7 +5076,15 @@ class HideUIExtension(Extension):
         self._recall_overlay_generation += 1
         self._recall_question_answered = False
         self._clear_recall_feedback()
-        self._show_recall_question(qwin, question["prompt"])
+        self._show_recall_question(qwin, question)
+        self._recall_question_shown_ms = int(time.time() * 1000)
+        from .experiment_log import log_e
+        log_e(
+            "recall_question",
+            num=int(self._recall_index + 1),
+            question_id=question.get("id", ""),
+            prompt=question.get("prompt", ""),
+            presented_ms=self._recall_question_shown_ms)
         if self._finish_btn is not None:
             self._finish_btn.hide()
         per_q = self._recall_question_time_sec
@@ -4732,6 +5172,12 @@ class HideUIExtension(Extension):
         if self._recall_index >= len(self._recall_questions):
             return
         question = self._recall_questions[self._recall_index]
+        answered_ms = int(time.time() * 1000)
+        shown_ms = int(getattr(self, "_recall_question_shown_ms", 0) or 0)
+        if shown_ms > 0:
+            time_taken_ms = max(0, answered_ms - shown_ms)
+        else:
+            time_taken_ms = 0
         self._recall_results.append({
             "question_id": question["id"],
             "prompt": question["prompt"],
@@ -4739,8 +5185,21 @@ class HideUIExtension(Extension):
             "clicked": clicked_cmd,
             "correct": bool(correct),
             "timeout": bool(timeout),
-            "time_remaining_sec": max(0, int(self._recall_remaining_sec)),
+            "unanswered": bool(timeout) or not clicked_cmd,
+            "presented_ms": shown_ms,
+            "answered_ms": answered_ms,
+            "time_taken_ms": time_taken_ms,
         })
+        from .experiment_log import log_t
+        log_t(
+            "recall",
+            question_id=question.get("id", ""),
+            num=self._recall_index + 1,
+            prompt=question.get("prompt", ""),
+            correct=bool(correct),
+            clicked=str(clicked_cmd or ""),
+            timeout=bool(timeout),
+            time_taken_ms=time_taken_ms)
 
     def _advance_recall_question(self, qwin):
         if self._quitting:
@@ -5021,14 +5480,28 @@ class HideUIExtension(Extension):
                 self._video_panel.end_recall_instructions_panel()
             from .recall_test import recall_score_percent
             total_q = len(self._recall_questions or [])
+            phase_skipped = (
+                getattr(self, "_recall_end_reason", "ended") == "experimenter_skip")
+            from .experiment_log import finalize_recall_block, log_e
+            self._recall_results = finalize_recall_block(
+                self._recall_questions,
+                self._recall_results,
+                phase_skipped=phase_skipped)
             score_pct = recall_score_percent(self._recall_results, total_q)
-            if (not self._recall_skip_save
-                    and getattr(self, "_save_recall_results_fn", None)
-                    and self._recall_results):
-                self._save_recall_results_fn(
-                    self.session, self._recall_results,
-                    recall_meta=getattr(self, "_recall_meta", None),
-                    score_percent=score_pct)
+            correct_count = sum(1 for r in self._recall_results if r.get("correct"))
+            answered_count = sum(
+                1 for r in self._recall_results
+                if not r.get("unanswered") and not r.get("phase_skipped"))
+            log_e(
+                "recall",
+                action="end",
+                learn_num=int(getattr(self, "_pending_recall_learn_num", 0) or 0),
+                question_count=total_q,
+                answered_count=answered_count,
+                correct_count=correct_count,
+                score_percent=score_pct,
+                reason=getattr(self, "_recall_end_reason", "ended"))
+            self._recall_end_reason = "ended"
             self._recall_skip_save = False
             self._recall_layout_profile_override = None
             self._ensure_study_dockers_visible(qwin)
@@ -5077,6 +5550,8 @@ class HideUIExtension(Extension):
                 self._tutorial_timer.stop()
             self._video_shown_for_canvas = False
             self._pause_video_for_phase_change()
+            if self._video_panel is not None:
+                self._video_panel.end_learning_instructions_panel()
         except Exception:
             _log(traceback.format_exc())
 
@@ -5084,11 +5559,15 @@ class HideUIExtension(Extension):
                             restart, after_learning_fn, learn_num,
                             layout_after=None):
         from .session_flow import run_tutorial_intro
-        from .video_panel import configure_video_for_tutorial
         if not run_tutorial_intro(title, body):
             self._request_quit(force=True)
             return
-        configure_video_for_tutorial(self.session, learn_num)
+        if self._is_session1() and int(learn_num) == 1:
+            from .video_panel import run_krita_environment_intro
+            if not run_krita_environment_intro():
+                self._request_quit(force=True)
+                return
+        self._active_learn_num = int(learn_num)
         self._tutorial_phase_sec = time_sec
         layout = layout_after or getattr(self, "_study_layout_profile", "A")
         self._learning_layout_profile = layout
@@ -5101,9 +5580,10 @@ class HideUIExtension(Extension):
                 return
             self._begin_tutorial(qwin, restart=restart, on_ready=lambda ok: (
                 self._request_quit(force=True) if not ok else
-                self._wait_for_tutorial_timer(
-                    time_sec, after_learning_fn,
-                    skippable=True, learn_num=learn_num)))
+                self._start_step_by_step_learning(
+                    after_learning_fn,
+                    learn_num=learn_num,
+                    time_sec=time_sec if self._learning_uses_phase_timer() else None)))
 
         self._prepare_study_canvas(
             qwin, after_canvas,
@@ -5122,74 +5602,47 @@ class HideUIExtension(Extension):
             recall_layout = LAYOUT_A
         else:
             recall_layout = self._recall_layout_profile()
+        practice_recall = self._is_session1() and int(learn_num) == 1
         self._start_recall_block(
             qwin, after_recall, skip_save=skip_save,
-            panel_message=recall_side_panel_message(opening=False),
+            panel_message=recall_side_panel_message(
+                opening=False, practice=practice_recall),
             learn_num=learn_num,
             layout_profile=recall_layout)
 
     def _run_break(self, qwin, after_fn, learn_num=0):
-        """Short break: Krita visible; break message in the video panel."""
+        """Timed break in a standalone gateway window; Krita stays hidden."""
         if self._quitting:
             return
         self._pending_break_learn_num = int(learn_num)
         layout = getattr(self, "_study_layout_profile", "A")
         self._prepare_study_canvas(
             qwin,
-            lambda ok: self._start_break_after_canvas(qwin, after_fn, ok),
+            lambda ok: self._start_break_window(qwin, after_fn, ok),
             label="break", layout_after=layout)
 
-    def _start_break_after_canvas(self, qwin, after_fn, ok):
-        """Show break UI after swapping to a blank canvas."""
-        from .session_flow import BREAK_SEC, BREAK_MESSAGE
-        from .video_panel import get_video_panel
+    def _start_break_window(self, qwin, after_fn, ok):
+        from .session_flow import run_timed_break, break_skip_password
+        from .video_panel import suspend_playback_for_phase_change
         if self._quitting:
             return
         if not ok:
             self._request_quit(force=True)
             return
-        self._break_active = True
         self._tutorial_active = False
         self._recall_active = False
-        self._set_phase_finish_visible(False)
-
-        def prepare():
-            self._ensure_ui_customized(qwin)
-
-        def after_reveal(reveal_ok):
-            if not reveal_ok:
-                self._request_quit(force=True)
-                return
-            if self._qwin_alive():
-                self._start_position_guard()
-                self._ensure_study_chrome(qwin)
-                self._show_study_toolbars(qwin)
-                self._hide_document_chrome(qwin)
-                self._restore_brush_size_slider(qwin)
-            panel = get_video_panel()
-            if panel is not None and self._qwin_alive():
-                layout = self._compute_layout(qwin)
-                panel.show_break_panel(
-                    layout["video_pos"], layout["video_size"],
-                    BREAK_MESSAGE["title"], BREAK_MESSAGE["body"])
-                self._video_panel = panel
-            learn_num = getattr(self, "_pending_break_learn_num", 0)
-            QTimer.singleShot(200, lambda: self._focus_canvas(qwin))
-            self._wait_for_tutorial_timer(
-                BREAK_SEC, lambda: self._end_break(qwin, after_fn),
-                urgent=False, break_learn_num=learn_num)
-
-        self._run_polished_reveal(qwin, prepare, on_ready=after_reveal)
-
-    def _end_break(self, qwin, after_fn):
-        if self._quitting:
-            return
-        self._break_active = False
-        self._set_skip_break_visible(False)
-        self._set_tutorial_timer_visible(False)
-        if self._video_panel is not None:
-            self._video_panel.end_break_panel()
+        suspend_playback_for_phase_change()
         self._pause_session_ui(qwin)
+        learn_num = getattr(self, "_pending_break_learn_num", 0)
+        skip_pwd = None
+        if learn_num and self.session:
+            skip_pwd = break_skip_password(
+                self.session.get("condition", "A"),
+                self.session.get("session", 1),
+                learn_num)
+        if not run_timed_break(skip_password=skip_pwd):
+            self._request_quit(force=True)
+            return
         if after_fn is not None:
             after_fn(qwin)
 
@@ -5329,6 +5782,8 @@ class HideUIExtension(Extension):
         if not run_session_complete(2):
             self._request_quit(force=True)
             return
+        from .experiment_log import end_session
+        end_session("complete")
         self._show_login_screen(qwin)
 
     def _show_login_screen(self, qwin):
@@ -5351,7 +5806,12 @@ class HideUIExtension(Extension):
             if info is None:
                 self._request_quit(force=True)
                 return
+            import datetime
+            info["started_at"] = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             self.session = info
+            from .experiment_log import start_session
+            start_session(self.session)
+            self._on_new_session_started()
             _log("returned to login: %s" % info)
             self._ensure_shortcuts_blocked(qwin)
             try:
@@ -5394,6 +5854,8 @@ class HideUIExtension(Extension):
 
             from .session_flow import run_session_complete
             run_session_complete(1)
+            from .experiment_log import end_session
+            end_session("complete")
             self._show_login_screen(qwin)
         except Exception:
             _log(traceback.format_exc())
@@ -5513,6 +5975,17 @@ class HideUIExtension(Extension):
             if on_canvas:
                 self._schedule_study_text_style()
 
+        if (self._learning_click_active()
+                and isinstance(obj, QWidget)
+                and event.type() == QEvent.MouseButtonRelease
+                and event.button() == Qt.LeftButton):
+            layer_name = obj.objectName() or ""
+            if (layer_name in ("bnDelete", "bnRaise", "bnLower")
+                    and self._widget_in_docker(obj, "KisLayerBox")):
+                self._log_learning_layer_button(layer_name)
+            elif self._widget_in_docker(obj, "ColorSelectorNg"):
+                self._log_learning_color_clicked()
+
         if (self._recall_active
                 and event.type() in (
                     QEvent.ToolTip, QEvent.StatusTip, QEvent.WhatsThis)):
@@ -5551,6 +6024,11 @@ class HideUIExtension(Extension):
                 return True
             if (event.type() == QEvent.MouseButtonRelease
                     and event.button() == Qt.LeftButton):
+                if (self._learning_tracker is not None
+                        and self._learning_tracker.active
+                        and not self._recall_active):
+                    self._learning_tracker.on_layer_event(
+                        "layer_added", "Add layer")
                 self._on_add_paint_layer()
                 return True
 
